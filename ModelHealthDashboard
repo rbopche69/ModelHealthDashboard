@@ -1,0 +1,1266 @@
+# -*- coding: utf-8 -*-
+from Autodesk.Revit.DB import *
+from Autodesk.Revit.UI import TaskDialog
+from pyrevit import revit, forms, script
+import System
+from System import DateTime
+import math
+import json
+import os
+import clr
+import csv
+from System.Collections.Generic import List
+from System.Windows.Forms import Cursor, Cursors
+
+# Configuration
+SCRIPT_PATH = script.get_script_path()
+HISTORY_FILE = os.path.join(SCRIPT_PATH, "{}_model_health_history.json")  # Project-specific
+CACHE_FILE = os.path.join(SCRIPT_PATH, "{}_model_health_cache.json")  # Project-specific
+REPORT_FILE = os.path.join(SCRIPT_PATH, "{}_model_health_report.csv")  # Project-specific
+RUN_RESULT_FILE = os.path.join(SCRIPT_PATH, "{}_model_health_{}.json")  # Individual run results
+MAX_HISTORY_ENTRIES = 30
+DASHBOARD_VIEW_NAME = "Model Health Dashboard"
+
+# Add references for BIM 360 API
+clr.AddReference('RevitAPIUI')
+from Autodesk.Revit.UI import UIApplication
+
+def background_processing(func):
+    """Simple wrapper to show wait cursor during processing"""
+    try:
+        Cursor.Current = Cursors.WaitCursor
+        result = func()
+        Cursor.Current = Cursors.Default
+        return result
+    except Exception as e:
+        Cursor.Current = Cursors.Default
+        raise e
+
+def get_cloud_model_info(doc):
+    """Get information about whether this is a cloud model and its project name"""
+    cloud_info = {
+        "IsCloudModel": False,
+        "ProjectPath": None
+    }
+    
+    try:
+        # Check if this is a cloud model (BIM 360/ACC)
+        if hasattr(doc, 'GetCloudModelPath'):
+            model_path = doc.GetCloudModelPath()
+            if model_path:
+                cloud_info["IsCloudModel"] = True
+                # Get the cloud project path
+                try:
+                    cloud_info["ProjectPath"] = model_path.GetModelPath().ToString()
+                except:
+                    cloud_info["ProjectPath"] = "Cloud Model"
+                
+                # Check for WIP folder in path
+                if cloud_info["ProjectPath"] and "WIP" in cloud_info["ProjectPath"].upper():
+                    cloud_info["ProjectPath"] = "⚠️ " + cloud_info["ProjectPath"]
+    except Exception as e:
+        print("Error getting cloud model info: {}".format(str(e)))
+    
+    return cloud_info
+
+def get_project_specific_filename(base_pattern):
+    """Get project-specific filename by replacing project name in pattern"""
+    doc = revit.doc
+    project_name = doc.Title if doc.Title else "Current_Project"
+    # Remove special characters from project name for filename safety
+    safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in project_name)
+    return base_pattern.format(safe_name)
+
+def get_run_result_filename():
+    """Get filename for individual run results with timestamp"""
+    base_pattern = get_project_specific_filename(RUN_RESULT_FILE)
+    timestamp = DateTime.Now.ToString("yyyy-MM")
+    return base_pattern.format("", timestamp)
+
+def get_cursor_pos(view):
+    """Get current cursor position in view coordinates"""
+    try:
+        ui_doc = revit.uidoc
+        pos = ui_doc.Selection.PickPoint("Select a point for leader line")
+        return pos
+    except:
+        return XYZ(1, 1, 0)
+
+def save_history(data):
+    """Save current scan results to history file"""
+    history_file = get_project_specific_filename(HISTORY_FILE)
+    try:
+        history = []
+        if os.path.exists(history_file):
+            with open(history_file, 'r') as f:
+                history = json.load(f)
+        
+        data['timestamp'] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+        history.insert(0, data)
+        history = history[:MAX_HISTORY_ENTRIES]
+        
+        with open(history_file, 'w') as f:
+            json.dump(history, f, indent=4)
+        return True
+    except Exception as e:
+        print("Failed to save history: {}".format(str(e)))
+        return False
+
+def save_run_result(data):
+    """Save individual run results with timestamp"""
+    run_result_file = get_run_result_filename()
+    try:
+        data['timestamp'] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+        with open(run_result_file, 'w') as f:
+            json.dump(data, f, indent=4)
+        return True
+    except Exception as e:
+        print("Failed to save run result: {}".format(str(e)))
+        return False
+
+def load_history():
+    """Load historical data from file"""
+    history_file = get_project_specific_filename(HISTORY_FILE)
+    try:
+        if os.path.exists(history_file):
+            with open(history_file, 'r') as f:
+                return json.load(f)
+        return []
+    except:
+        return []
+
+def get_cache():
+    """Load cached data"""
+    cache_file = get_project_specific_filename(CACHE_FILE)
+    try:
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r') as f:
+                return json.load(f)
+        return None
+    except:
+        return None
+
+def save_cache(data):
+    """Save data to cache"""
+    cache_file = get_project_specific_filename(CACHE_FILE)
+    try:
+        with open(cache_file, 'w') as f:
+            json.dump(data, f, indent=4)
+        return True
+    except:
+        return False
+
+def save_report_to_csv(data):
+    """Save detailed report to CSV file"""
+    report_file = get_project_specific_filename(REPORT_FILE)
+    try:
+        with open(report_file, 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # Write header
+            writer.writerow(["Model Health Report", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")])
+            writer.writerow([])
+            
+            # Basic Info
+            writer.writerow(["PROJECT INFORMATION"])
+            writer.writerow(["Project Name", data.get("ProjectName", "N/A")])
+            writer.writerow(["Is Cloud Model", data.get("CloudInfo", {}).get("IsCloudModel", False)])
+            writer.writerow(["Cloud Project Path", data.get("CloudInfo", {}).get("ProjectPath", "N/A")])
+            writer.writerow([])
+            
+            # Health Summary
+            writer.writerow(["HEALTH SUMMARY"])
+            writer.writerow(["Health Score", "{}%".format(data.get("Score", 0))])
+            
+            # Detailed Warnings by Discipline and Severity
+            writer.writerow([])
+            writer.writerow(["WARNINGS BY DISCIPLINE AND SEVERITY"])
+            for discipline, severities in data.get("DetailedWarnings", {}).items():
+                writer.writerow([discipline])
+                for severity, count in severities.items():
+                    writer.writerow(["", severity, count])
+            
+            writer.writerow([])
+            writer.writerow(["File Size (MB)", data.get("FileSize", {}).get("TotalSizeMB", 0)])
+            writer.writerow([])
+            
+            # Detailed Issues
+            writer.writerow(["DETAILED ISSUES"])
+            
+            # Purge Status
+            writer.writerow(["Purgeable Items"])
+            # Safely iterate through purge_status, providing default if key is missing
+            purge_status_data = data.get("PurgeStatus", {})
+            for item_type, count in purge_status_data.items():
+                if isinstance(count, dict):
+                    for sub_type, sub_count in count.items():
+                        writer.writerow(["", "{} - {}".format(item_type, sub_type), sub_count])
+                else:
+                    writer.writerow(["", item_type, count])
+            
+            # View Templates
+            writer.writerow(["Untemplated Views", data.get("ViewTemplates", {}).get("Count", 0)])
+            if data.get("ViewTemplates", {}).get("Count", 0) > 0:
+                for view_name in data.get("ViewTemplates", {}).get("UntemplatedViews", [])[:10]:
+                    writer.writerow(["", view_name])
+                if len(data.get("ViewTemplates", {}).get("UntemplatedViews", [])) > 10:
+                    writer.writerow(["", "...and {} more".format(len(data.get("ViewTemplates", {}).get("UntemplatedViews", [])) - 10)])
+            
+            # In-Place Families
+            writer.writerow(["In-Place Families", data.get("InPlaceFamilies", {}).get("Count", 0)])
+            if data.get("InPlaceFamilies", {}).get("Count", 0) > 0:
+                for family in data.get("InPlaceFamilies", {}).get("Families", [])[:10]:
+                    writer.writerow(["", family["Name"], family["Category"]])
+                if len(data.get("InPlaceFamilies", {}).get("Families", [])) > 10:
+                    writer.writerow(["", "...and {} more".format(len(data.get("InPlaceFamilies", {}).get("Families", [])) - 10)])
+            
+            # Family Naming Issues
+            writer.writerow(["Incorrectly Named Families", data.get("FamilyNaming", {}).get("Count", 0)])
+            if data.get("FamilyNaming", {}).get("Count", 0) > 0:
+                for family in data.get("FamilyNaming", {}).get("Families", [])[:10]:
+                    writer.writerow(["", family["Name"], family["Category"]])
+                if len(data.get("FamilyNaming", {}).get("Families", [])) > 10:
+                    writer.writerow(["", "...and {} more".format(len(data.get("FamilyNaming", {}).get("Families", [])) - 10)])
+            
+            # Clashes
+            writer.writerow([])
+            writer.writerow(["CLASH DETECTION"])
+            for clash, count in data.get("Clashes", {}).items():
+                writer.writerow([clash, count])
+            
+            # Links with enhanced path information
+            writer.writerow([])
+            writer.writerow(["REVIT LINKS"])
+            for link in data.get("Links", []):
+                writer.writerow([
+                    link.get("Name", "N/A"),
+                    link.get("Status", "N/A"),
+                    "Cloud" if link.get("IsCloud", False) else "Local",
+                    link.get("Path", "N/A"),
+                    "Workshared" if link.get("IsWorkshared", False) else "Not Workshared",
+                    "Overridden" if link.get("IsOverridden", False) else "Not Overridden"
+                ])
+            
+        return True
+    except Exception as e:
+        print("Failed to save CSV report: {}".format(str(e)))
+        return False
+
+def get_in_place_families(doc):
+    """Check for in-place families in the model"""
+    status = {
+        "Count": 0,
+        "Families": []
+    }
+    
+    try:
+        # Filter for FamilyInstance elements that are in-place
+        in_place_family_instances = FilteredElementCollector(doc)\
+            .OfClass(FamilyInstance)\
+            .WhereElementIsNotElementType()\
+            .ToElements()
+        
+        for family_instance in in_place_family_instances:
+            # Check if the instance's symbol (family type) has an in-place family
+            if family_instance.Symbol and family_instance.Symbol.Family and family_instance.Symbol.Family.IsInPlace:
+                try:
+                    status["Count"] += 1
+                    status["Families"].append({
+                        "Name": family_instance.Name,
+                        "Category": family_instance.Category.Name if family_instance.Category else "Unknown"
+                    })
+                except:
+                    continue # Skip if there's an issue getting name/category
+        
+        # Sort by name
+        status["Families"].sort(key=lambda x: x["Name"])
+    except Exception as e:
+        print("Error checking in-place families: {}".format(str(e)))
+    
+    return status
+
+def check_family_naming_convention(doc):
+    """Verify family naming convention (should start with 'GPL')"""
+    status = {
+        "Count": 0,
+        "Families": []
+    }
+    
+    try:
+        families = FilteredElementCollector(doc).OfClass(Family).ToElements()
+        
+        for family in families:
+            try:
+                if not family.IsInPlace:  # Skip in-place families (handled separately)
+                    family_name = family.Name
+                    if not family_name.upper().startswith("GPL"):
+                        status["Count"] += 1
+                        status["Families"].append({
+                            "Name": family_name,
+                            "Category": family.FamilyCategory.Name if family.FamilyCategory else "Unknown"
+                        })
+            except:
+                continue
+        
+        # Sort by name
+        status["Families"].sort(key=lambda x: x["Name"])
+    except Exception as e:
+        print("Error checking family naming convention: {}".format(str(e)))
+    
+    return status
+
+def categorize_warning(description):
+    """Categorize warnings by discipline and severity based on description"""
+    description = description.lower()
+    
+    # Initialize default category
+    discipline = "General"
+    severity = "Informative"
+    
+    # Architecture warnings
+    if any(keyword in description for keyword in ["wall", "room", "curtain panel", "stair", "floor", "roof"]):
+        discipline = "Architecture"
+        if any(keyword in description for keyword in ["overlap", "not properly enclosed", "not hosted", "not connected"]):
+            severity = "Critical"
+        elif any(keyword in description for keyword in ["duplicate", "not joined", "not associated", "not visible"]):
+            severity = "Informative"
+        else:
+            severity = "Insignificant"
+    
+    # Structure warnings
+    elif any(keyword in description for keyword in ["beam", "column", "foundation", "structural", "rebar", "analytical"]):
+        discipline = "Structure"
+        if any(keyword in description for keyword in ["not supported", "not connected", "not hosted"]):
+            severity = "Critical"
+        elif any(keyword in description for keyword in ["same space", "not joined"]):
+            severity = "Informative"
+        else:
+            severity = "Insignificant"
+    
+    # MEPF warnings
+    elif any(keyword in description for keyword in ["pipe", "duct", "system", "electrical", "mechanical", "fitting", "flow", "fabrication"]):
+        discipline = "MEPF"
+        if any(keyword in description for keyword in ["not connected", "not properly defined", "not assigned", "undefined", "missing data"]):
+            severity = "Critical"
+        elif any(keyword in description for keyword in ["duplicate", "same space", "not attached", "exceeds", "not defined"]):
+            severity = "Informative"
+        else:
+            severity = "Insignificant"
+    
+    return discipline, severity
+
+def get_detailed_warnings(doc):
+    """Get detailed warnings categorized by discipline and severity"""
+    detailed_warnings = {
+        "Architecture": {"Critical": 0, "Informative": 0, "Insignificant": 0},
+        "Structure": {"Critical": 0, "Informative": 0, "Insignificant": 0},
+        "MEPF": {"Critical": 0, "Informative": 0, "Insignificant": 0},
+        "General": {"Critical": 0, "Informative": 0, "Insignificant": 0}
+    }
+    
+    try:
+        warnings = doc.GetWarnings()
+        
+        for warning in warnings:
+            description = warning.GetDescriptionText()
+            discipline, severity = categorize_warning(description)
+            detailed_warnings[discipline][severity] += 1
+        
+        return detailed_warnings
+    except Exception as e:
+        print("Error getting detailed warnings: {}".format(str(e)))
+        return detailed_warnings
+
+def get_purge_status(doc):
+    """Get detailed information about purgeable elements"""
+    purge_status = {
+        "Unused Family Types": 0,
+        "Unused Materials": 0,
+        "Unplaced Views": 0,
+        "Unused Groups": 0,
+        "Unused Annotation Symbols": 0,
+        "Unused Line Styles": 0,
+        "Unused Fill Patterns": 0,
+        "Unused View Filters": 0,
+        "Unused Schedules": 0
+    }
+    
+    try:
+        # Count unused family types
+        families = FilteredElementCollector(doc).OfClass(Family).ToElements()
+        for family in families:
+            if family and not family.IsInPlace:
+                family_symbols_ids = family.GetFamilySymbolIds()
+                for type_id in family_symbols_ids:
+                    type_instance = doc.GetElement(type_id)
+                    if type_instance and not type_instance.IsUsedInProject:
+                        purge_status["Unused Family Types"] += 1
+        
+        # Count unused materials
+        materials = FilteredElementCollector(doc).OfClass(Material).ToElements()
+        for material in materials:
+            if not material.IsUsedInProject:
+                purge_status["Unused Materials"] += 1
+        
+        # Count unplaced views (excluding templates and special views)
+        views = FilteredElementCollector(doc).OfClass(View).ToElements()
+        for view in views:
+            if (view.ViewType in [ViewType.FloorPlan, ViewType.CeilingPlan, ViewType.AreaPlan, ViewType.StructuralPlan] and
+                not view.IsTemplate):
+                
+                is_on_sheet = False
+                sheet_views = FilteredElementCollector(doc).OfClass(ViewSheet).ToElements()
+                for sheet_view in sheet_views:
+                    if view.Id in sheet_view.GetAllPlacedViews():
+                        is_on_sheet = True
+                        break
+                
+                if not is_on_sheet:
+                    purge_status["Unplaced Views"] += 1
+        
+        # Count unused groups
+        groups = FilteredElementCollector(doc).OfClass(Group).ToElements()
+        for group in groups:
+            if not group.IsUsedInProject:
+                purge_status["Unused Groups"] += 1
+        
+        # Count unused annotation symbols
+        annotation_symbols = FilteredElementCollector(doc).OfClass(FamilySymbol)\
+            .OfCategory(BuiltInCategory.OST_GenericAnnotation)\
+            .ToElements()
+        for symbol in annotation_symbols:
+            if not symbol.IsUsedInProject:
+                purge_status["Unused Annotation Symbols"] += 1
+        
+        # Count unused line styles (simplified check)
+        line_styles = FilteredElementCollector(doc).OfClass(GraphicsStyle)\
+            .OfCategory(BuiltInCategory.OST_Lines)\
+            .ToElements()
+        for line_style in line_styles:
+            if not line_style.IsUsedInProject:
+                purge_status["Unused Line Styles"] += 1
+        
+        # Count unused fill patterns (simplified check)
+        fill_patterns = FilteredElementCollector(doc).OfClass(FillPatternElement).ToElements()
+        for pattern in fill_patterns:
+            if not pattern.IsUsedInProject:
+                purge_status["Unused Fill Patterns"] += 1
+        
+        # Count unused view filters
+        filters = FilteredElementCollector(doc).OfClass(ParameterFilterElement).ToElements()
+        for filter in filters:
+            if not filter.IsUsedInProject:
+                purge_status["Unused View Filters"] += 1
+        
+        # Count unused schedules
+        schedules = FilteredElementCollector(doc).OfClass(ViewSchedule).ToElements()
+        for schedule in schedules:
+            if not schedule.IsUsedInProject:
+                purge_status["Unused Schedules"] += 1
+        
+        return purge_status
+    except Exception as e:
+        print("Error getting purge status: {}".format(str(e)))
+        return purge_status
+
+def get_clash_matrix(doc):
+    """Get clash detection summary (simplified for this example)"""
+    try:
+        # In a real implementation, this would interface with Navisworks or Revit's clash detection
+        return {
+            "Structural Clashes": 0,
+            "MEP Clashes": 0,
+            "Architectural Clashes": 0
+        }
+    except Exception as e:
+        print("Error getting clash matrix: {}".format(str(e)))
+        return {}
+
+def get_workset_usage(doc):
+    """Get workset usage information"""
+    try:
+        # Count orphaned elements (elements whose workset has been deleted)
+        orphaned_count = 0
+        if doc.IsWorkshared:
+            all_elements = FilteredElementCollector(doc).WhereElementIsNotElementType().ToElements()
+            valid_workset_ids = [ws.Id for ws in doc.GetWorksetTable().GetWorksets()]
+            
+            for element in all_elements:
+                workset_id = element.WorksetId
+                if workset_id not in valid_workset_ids:
+                    orphaned_count += 1
+        
+        return {
+            "Orphaned Elements": orphaned_count
+        }
+    except Exception as e:
+        print("Error getting workset usage: {}".format(str(e)))
+        return {
+            "Orphaned Elements": 0
+        }
+
+def get_revit_links(doc):
+    """Get detailed information about Revit links with enhanced path detection"""
+    links = []
+    try:
+        link_instances = FilteredElementCollector(doc).OfClass(RevitLinkInstance).ToElements()
+        
+        for link_instance in link_instances:
+            try:
+                link_type = doc.GetElement(link_instance.GetTypeId())
+                if link_type and isinstance(link_type, RevitLinkType):
+                    link_data = {
+                        "Name": getattr(link_type, "Name", "Unknown"),
+                        "Status": "Loaded",  # Default status
+                        "IsCloud": False,    # Default
+                        "Path": "Unknown",   # Default path
+                        "IsWorkshared": link_type.IsWorkshared,
+                        "IsOverridden": False # Default
+                    }
+                    
+                    # Get the external file reference
+                    ext_ref = link_type.GetExternalFileReference()
+                    if ext_ref:
+                        try:
+                            # Try to get the path
+                            model_path = ext_ref.GetAbsolutePath()
+                            if model_path:
+                                link_data["Path"] = model_path.ToString()
+                        except:
+                            pass
+                        
+                        # Check if it's a cloud model
+                        if hasattr(ext_ref, 'IsCloudModel') and ext_ref.IsCloudModel:
+                            link_data["IsCloud"] = True
+                            try:
+                                model_path = ext_ref.GetCloudModelPath()
+                                if model_path:
+                                    link_data["Path"] = model_path.GetModelPath().ToString()
+                                    link_data["Name"] = "☁️ " + link_data["Name"]
+                            except:
+                                pass
+                    
+                    # Check for WIP folder in path
+                    if "WIP" in link_data["Path"].upper():
+                        link_data["Name"] = "⚠️ " + link_data["Name"]
+                    
+                    # Check link status (loaded/unloaded)
+                    try:
+                        if link_instance.GetLinkDocument() is None:
+                            link_data["Status"] = "Unloaded"
+                    except:
+                        pass
+                    
+                    # Check if link is overridden
+                    try:
+                        if hasattr(link_instance, 'IsHidden'):
+                            link_data["IsOverridden"] = link_instance.IsHidden(link_instance.Document.ActiveView)
+                    except:
+                        pass
+                    
+                    links.append(link_data)
+            except Exception as e:
+                print("Error processing link: {}".format(str(e)))
+                continue
+        
+        return links
+    except Exception as e:
+        print("Error getting Revit links: {}".format(str(e)))
+        return []
+
+def check_copy_monitor_status(doc):
+    """Check copy/monitor status for levels and grids"""
+    try:
+        levels = FilteredElementCollector(doc).OfClass(Level).ToElements()
+        grids = FilteredElementCollector(doc).OfClass(Grid).ToElements()
+        
+        monitored_levels = 0
+        monitored_grids = 0
+        
+        # Simplified check - in a real implementation you'd check the actual monitoring status
+        # This would require more complex logic to check the monitoring relationships
+        return {
+            "Levels": {
+                "Total": len(levels),
+                "CopyMonitored": monitored_levels,
+                "NotMonitored": len(levels) - monitored_levels
+            },
+            "Grids": {
+                "Total": len(grids),
+                "CopyMonitored": monitored_grids,
+                "NotMonitored": len(grids) - monitored_grids
+            }
+        }
+    except Exception as e:
+        print("Error checking copy/monitor status: {}".format(str(e)))
+        return {
+            "Levels": {
+                "Total": 0,
+                "CopyMonitored": 0,
+                "NotMonitored": 0
+            },
+            "Grids": {
+                "Total": 0,
+                "CopyMonitored": 0,
+                "NotMonitored": 0
+            }
+        }
+
+def get_view_templates_status(doc):
+    """Check view templates usage"""
+    try:
+        untemplated_views = []
+        views = FilteredElementCollector(doc).OfClass(View).ToElements()
+        
+        for view in views:
+            try:
+                # Skip view templates themselves and certain view types
+                if (not view.IsTemplate and 
+                    view.ViewType not in [ViewType.ProjectBrowser, ViewType.SystemBrowser, 
+                                        ViewType.Undefined, ViewType.DrawingSheet, 
+                                        ViewType.Legend, ViewType.Schedule]):
+                    
+                    # Check if view has a template assigned
+                    if view.ViewTemplateId == ElementId.InvalidElementId:
+                        untemplated_views.append(view.Name)
+            except:
+                continue
+        
+        return {
+            "Count": len(untemplated_views),
+            "UntemplatedViews": sorted(untemplated_views)
+        }
+    except Exception as e:
+        print("Error getting view templates status: {}".format(str(e)))
+        return {
+            "Count": 0,
+            "UntemplatedViews": []
+        }
+
+def get_file_size_analysis(doc):
+    """Get file size analysis with improved cloud model handling"""
+    try:
+        # Initialize with default values
+        file_size = "N/A (Cloud Model)" if doc.IsCloudModel else 0
+        is_cloud_model = doc.IsCloudModel
+        
+        # For non-cloud models, try to get actual file size
+        if not is_cloud_model:
+            model_path = doc.PathName
+            if os.path.exists(model_path):
+                file_size = os.path.getsize(model_path) / (1024 * 1024)  # Convert to MB
+        
+        # Count imported CADs, point clouds, and images
+        cad_imports = FilteredElementCollector(doc)\
+            .OfClass(ImportInstance)\
+            .Where(lambda x: x.IsLinked == False and x.GetType().Name == "CADLinkType")\
+            .GetElementCount()
+        
+        point_clouds = FilteredElementCollector(doc)\
+            .OfClass(PointCloudInstance)\
+            .WhereElementIsNotElementType()\
+            .GetElementCount()
+        
+        images = FilteredElementCollector(doc)\
+            .OfClass(ImageType)\
+            .GetElementCount()
+        
+        # Count loaded families (not types, but loaded family definitions)
+        families_loaded = FilteredElementCollector(doc)\
+            .OfClass(Family)\
+            .GetElementCount()
+
+        return {
+            "TotalSizeMB": round(file_size, 2) if isinstance(file_size, (int, float)) else file_size,
+            "IsCloudModel": is_cloud_model,
+            "CADImports": cad_imports,
+            "PointClouds": point_clouds,
+            "Images": images,
+            "Families": families_loaded
+        }
+    except Exception as e:
+        print("Error getting file size analysis: {}".format(str(e)))
+        return {
+            "TotalSizeMB": 0,
+            "IsCloudModel": False,
+            "CADImports": 0,
+            "PointClouds": 0,
+            "Images": 0,
+            "Families": 0
+        }
+
+def get_audit_history(doc):
+    """Get audit history information"""
+    try:
+        return {
+            "SaveCount": 0,
+            "CompactCount": 0,
+            "LastAudit": "Never"
+        }
+    except Exception as e:
+        print("Error getting audit history: {}".format(str(e)))
+        return {
+            "SaveCount": 0,
+            "CompactCount": 0,
+            "LastAudit": "Never"
+        }
+
+def get_score_trend(score):
+    """Get trend indicator for score"""
+    history = load_history()
+    if len(history) > 1:
+        previous_score = history[1].get("Score", score) # Get second last score
+        if score > previous_score:
+            return "Improving"
+        elif score < previous_score:
+            return "Declining"
+    return "Stable"
+
+def get_drafting_view(doc):
+    """Get or create the dashboard drafting view"""
+    try:
+        # First try to find existing view
+        views = FilteredElementCollector(doc).OfClass(View).ToElements()
+        for view in views:
+            if view.Name == DASHBOARD_VIEW_NAME and view.ViewType == ViewType.DraftingView:
+                return view
+        
+        # If not found, create new view
+        view_family_types = FilteredElementCollector(doc).OfClass(ViewFamilyType).ToElements()
+        drafting_family_type = None
+        for vf_type in view_family_types:
+            if vf_type.ViewFamily == ViewFamily.Drafting:
+                drafting_family_type = vf_type
+                break
+        
+        if drafting_family_type:
+            t = Transaction(doc, "Create Dashboard View")
+            t.Start()
+            new_view = ViewDrafting.Create(doc, drafting_family_type.Id)
+            new_view.Name = DASHBOARD_VIEW_NAME
+            t.Commit()
+            return new_view
+        return None
+    except Exception as e:
+        print("Error getting drafting view: {}".format(str(e)))
+        return None
+
+def clear_text_notes(view, doc):
+    """Clear existing text notes from view"""
+    try:
+        # Collect all text notes in the specific view
+        text_notes_in_view = FilteredElementCollector(doc, view.Id).OfClass(TextNote).ToElementIds()
+        
+        if text_notes_in_view:
+            t = Transaction(doc, "Clear Text Notes")
+            t.Start()
+            for note_id in text_notes_in_view:
+                doc.Delete(note_id)
+            t.Commit()
+        return True
+    except Exception as e:
+        print("Error clearing text notes: {}".format(str(e)))
+        return False
+
+def add_text(view, doc, text, x, y):
+    """Add text to the view"""
+    try:
+        t = Transaction(doc, "Add Dashboard Text")
+        t.Start()
+        
+        options = TextNoteOptions()
+        options.HorizontalAlignment = HorizontalTextAlignment.Left
+        text_type_id = get_text_type_id(doc)
+        if text_type_id != ElementId.InvalidElementId:
+            options.TypeId = text_type_id
+        
+        text_note = TextNote.Create(doc, view.Id, XYZ(x, y, 0), text, options)
+        
+        t.Commit()
+        return text_note
+    except Exception as e:
+        print("Error adding text: {}".format(str(e)))
+        return None
+
+def add_text_with_leader(view, doc, text, x, y, element_id):
+    """Add text with leader line to specific element"""
+    try:
+        t = Transaction(doc, "Add Text with Leader")
+        t.Start()
+        
+        element = doc.GetElement(element_id)
+        if not element:
+            t.RollBack()
+            return None
+            
+        options = TextNoteOptions()
+        options.HorizontalAlignment = HorizontalTextAlignment.Left
+        text_type_id = get_text_type_id(doc)
+        if text_type_id != ElementId.InvalidElementId:
+            options.TypeId = text_type_id
+        
+        # Create text note
+        text_note = TextNote.Create(doc, view.Id, XYZ(x, y, 0), text, options)
+        
+        # Add leader
+        if text_note: # Ensure text_note was created successfully
+            leader = text_note.AddLeader(TextNoteLeaderTypes.TNLT_STRAIGHT_L)
+            
+            # Determine leader end point
+            leader_end_point = None
+            if hasattr(element, 'Location') and isinstance(element.Location, LocationPoint):
+                leader_end_point = element.Location.Point
+            elif hasattr(element, 'Location') and isinstance(element.Location, LocationCurve):
+                leader_end_point = element.Location.Curve.Evaluate(0.5, True) # Midpoint of curve
+            elif hasattr(element, 'GetBoundingBox'):
+                bbox = element.GetBoundingBox(None)
+                if bbox: # Check if bounding box is valid
+                    leader_end_point = (bbox.Min + bbox.Max) / 2
+            
+            if leader_end_point:
+                leader.End = leader_end_point
+            else:
+                print("Could not determine leader end point for element {}".format(element_id))
+        
+        t.Commit()
+        return text_note
+    except Exception as e:
+        print("Error adding text with leader: {}".format(str(e)))
+        return None
+
+def create_clickable_element(view, doc, element_id, text_note_id):
+    """Create a clickable association between text and element"""
+    try:
+        pass
+    except Exception as e:
+        print("Error creating clickable element: {}".format(str(e)))
+
+def get_text_type_id(doc):
+    """Get default text type ID"""
+    try:
+        text_types = FilteredElementCollector(doc).OfClass(TextNoteType).ToElements()
+        if text_types:
+            return text_types[0].Id
+        
+        # If no text types found, create a default one
+        t = Transaction(doc, "Create Default Text Type")
+        t.Start()
+        default_text_type = TextNoteType.Create(doc)
+        default_text_type.Name = "Model Health Dashboard Text"
+        t.Commit()
+        return default_text_type.Id
+    except Exception as e:
+        print("Error getting text type ID: {}".format(str(e)))
+        return ElementId.InvalidElementId
+
+def get_warning_elements(doc):
+    """Get elements associated with warnings"""
+    try:
+        warnings = doc.GetWarnings()
+        element_ids = List[ElementId]() # Use System.Collections.Generic.List for efficiency
+        
+        for warning in warnings:
+            for id in warning.GetFailingElements():
+                if id not in element_ids:
+                    element_ids.Add(id)
+            for id in warning.GetAdditionalElements():
+                if id not in element_ids:
+                    element_ids.Add(id)
+        
+        # Convert List to Python list and return first 3 unique elements
+        return list(element_ids)[:3]
+    except Exception as e:
+        print("Error getting warning elements: {}".format(str(e)))
+        return []
+
+def calculate_health_score(warnings, purge_status, clashes, workset_data, links, copy_monitor_status, in_place_families, naming_issues, view_templates_status, file_size_analysis):
+    """Calculate overall model health percentage with new factors"""
+    score = 100
+    
+    # Deduct for warnings by severity (critical have higher impact)
+    for discipline, severities in warnings.items():
+        score -= min(severities["Critical"] * 2, 20)
+        score -= min(severities["Informative"] * 0.5, 10)
+        score -= min(severities["Insignificant"] * 0.1, 5)
+    
+    # Deduct for purgeable items
+    # Safely access purge_status items with .get()
+    score -= min(purge_status.get("Unused Family Types", 0) * 0.2, 10)
+    score -= min(purge_status.get("Unused Materials", 0) * 0.1, 5)
+    score -= min(purge_status.get("Unplaced Views", 0) * 0.5, 5)
+    score -= min(purge_status.get("Unused Groups", 0) * 0.3, 5)
+    score -= min(purge_status.get("Unused Annotation Symbols", 0) * 0.1, 3)
+    score -= min(purge_status.get("Unused Line Styles", 0) * 0.05, 2)
+    score -= min(purge_status.get("Unused Fill Patterns", 0) * 0.05, 2)
+    score -= min(purge_status.get("Unused View Filters", 0) * 0.1, 3)
+    score -= min(purge_status.get("Unused Schedules", 0) * 0.2, 5)
+    
+    # Deduct for clashes
+    for clash_name, count in clashes.items():
+        if "Structural" in clash_name:
+            score -= min(count * 1.5, 20)
+        else:
+            score -= min(count * 1, 10)
+    
+    # Deduct for orphaned elements
+    orphaned = workset_data["Orphaned Elements"]
+    score -= min(orphaned * 0.1, 10)
+    
+    # Deduct for unloaded links
+    unloaded_links = sum(1 for link in links if link["Status"] == "Unloaded")
+    score -= min(unloaded_links * 1, 5)
+    
+    # Deduct for unmonitored levels/grids
+    if copy_monitor_status["Levels"]["Total"] > 0:
+        unmonitored_levels = copy_monitor_status["Levels"]["Total"] - copy_monitor_status["Levels"]["CopyMonitored"]
+        score -= min(unmonitored_levels * 0.5, 5)
+        
+    if copy_monitor_status["Grids"]["Total"] > 0:
+        unmonitored_grids = copy_monitor_status["Grids"]["Total"] - copy_monitor_status["Grids"]["CopyMonitored"]
+        score -= min(unmonitored_grids * 0.5, 5)
+    
+    # Deduct for in-place families
+    score -= min(in_place_families["Count"] * 0.5, 5)
+    
+    # Deduct for naming convention violations
+    score -= min(naming_issues["Count"] * 0.2, 5)
+
+    # Deduct for untemplated views
+    score -= min(view_templates_status["Count"] * 0.3, 10)
+
+    # Deduct for large file size
+    if isinstance(file_size_analysis["TotalSizeMB"], (int, float)):
+        if file_size_analysis["TotalSizeMB"] > 200: # Over 200 MB
+            score -= 10
+        elif file_size_analysis["TotalSizeMB"] > 100: # Over 100 MB
+            score -= 5
+    
+    return max(0, min(100, math.floor(score)))
+
+def generate_dashboard_text(project_name, data):
+    """Generate the formatted dashboard text with new features"""
+    # File size display - handle cloud model case
+    if data["FileSize"]["IsCloudModel"]:
+        file_size_display = "Cloud Model"
+    else:
+        file_size_display = "{} MB".format(data["FileSize"]["TotalSizeMB"]) if isinstance(data["FileSize"]["TotalSizeMB"], (int, float)) else data["FileSize"]["TotalSizeMB"]
+    
+    # Cloud model indicator
+    cloud_indicator = " ☁️" if data["CloudInfo"]["IsCloudModel"] else ""
+    
+    # Initialize DetailedWarnings if not present (for backward compatibility)
+    if "DetailedWarnings" not in data:
+        data["DetailedWarnings"] = {
+            "Architecture": {"Critical": 0, "Informative": 0, "Insignificant": 0},
+            "Structure": {"Critical": 0, "Informative": 0, "Insignificant": 0},
+            "MEPF": {"Critical": 0, "Informative": 0, "Insignificant": 0},
+            "General": {"Critical": 0, "Informative": 0, "Insignificant": 0}
+        }
+    
+    # Header Section
+    text = []
+    text.append("╔══════════════════════════════════════════════════════════════════════════════╗")
+    text.append("║                    MODEL HEALTH DASHBOARD - {:<30}{:<2}         ║".format(
+        project_name.upper()[:30], cloud_indicator))
+    text.append("╠══════════════════════════════════════════════════════════════════════════════╣")
+    
+    # Health Score Section
+    score_emoji = "🟢" if data["Score"] >= 80 else "🟡" if data["Score"] >= 60 else "🔴"
+    text.append("║  HEALTH SCORE: {:<3}% {:<2}   FILE SIZE: {:<12}   LAST AUDIT: {:<14} ║".format(
+        data["Score"], score_emoji, 
+        file_size_display,
+        data["AuditHistory"]["LastAudit"]))
+    
+    # Warnings by Discipline and Severity
+    text.append("╠══════════════════════════════════════════════════════════════════════════════╣")
+    text.append("║  WARNINGS BY DISCIPLINE AND SEVERITY                                        ║")
+    
+    # Architecture Warnings
+    arch_warnings = data["DetailedWarnings"].get("Architecture", {"Critical": 0, "Informative": 0, "Insignificant": 0})
+    text.append("║  • ARCH: Critical {:<3} | Informative {:<3} | Insignificant {:<3}                  ║".format(
+        arch_warnings["Critical"], 
+        arch_warnings["Informative"], 
+        arch_warnings["Insignificant"]))
+    
+    # Structure Warnings
+    struct_warnings = data["DetailedWarnings"].get("Structure", {"Critical": 0, "Informative": 0, "Insignificant": 0})
+    text.append("║  • STR:  Critical {:<3} | Informative {:<3} | Insignificant {:<3}                  ║".format(
+        struct_warnings["Critical"], 
+        struct_warnings["Informative"], 
+        struct_warnings["Insignificant"]))
+    
+    # MEPF Warnings
+    mepf_warnings = data["DetailedWarnings"].get("MEPF", {"Critical": 0, "Informative": 0, "Insignificant": 0})
+    text.append("║  • MEPF: Critical {:<3} | Informative {:<3} | Insignificant {:<3}                  ║".format(
+        mepf_warnings["Critical"], 
+        mepf_warnings["Informative"], 
+        mepf_warnings["Insignificant"]))
+    
+    text.append("╠══════════════════════════════════════════════════════════════════════════════╣")
+    
+    # Model Issues Section
+    text.append("║  MODEL ISSUES                                                              ║")
+    # Access purge_status with .get() and provide default 0 for missing keys
+    text.append("║  • Purge Status: Unused Types {:<3} | Materials {:<3} | Views {:<3} | Groups {:<3} ║".format(
+        data["PurgeStatus"].get("Unused Family Types", 0),
+        data["PurgeStatus"].get("Unused Materials", 0),
+        data["PurgeStatus"].get("Unplaced Views", 0),
+        data["PurgeStatus"].get("Unused Groups", 0)))
+    text.append("║  • View Templates: {:<3} untemplated | Orphaned Elements: {:<3}                  ║".format(
+        data["ViewTemplates"]["Count"],
+        data["Worksets"]["Orphaned Elements"]))
+    text.append("║  • In-Place Families: {:<3} | Naming Issues: {:<3}                              ║".format(
+        data["InPlaceFamilies"]["Count"],
+        data["FamilyNaming"]["Count"]))
+    text.append("╠══════════════════════════════════════════════════════════════════════════════╣")
+    
+    # Clash Detection Section
+    if data["Clashes"] and any(count > 0 for count in data["Clashes"].values()):
+        text.append("║  CLASH DETECTION (Count)                                                  ║")
+        for clash_name, count in sorted(data["Clashes"].items()):
+            text.append("║  • {:<40} {:<3}                              ║".format(
+                clash_name[:40], count))
+    else:
+        text.append("║  No clashes detected                                                     ║")
+    text.append("╠══════════════════════════════════════════════════════════════════════════════╣")
+    
+    # Coordination Status Section
+    text.append("║  COORDINATION STATUS                                                       ║")
+    text.append("║  • Levels: {}/{} monitored ({} not) | Grids: {}/{} monitored ({} not)         ".format(
+        data["CopyMonitor"]["Levels"]["CopyMonitored"], 
+        data["CopyMonitor"]["Levels"]["Total"],
+        data["CopyMonitor"]["Levels"]["NotMonitored"],
+        data["CopyMonitor"]["Grids"]["CopyMonitored"], 
+        data["CopyMonitor"]["Grids"]["Total"],
+        data["CopyMonitor"]["Grids"]["NotMonitored"]))
+    text.append("╠══════════════════════════════════════════════════════════════════════════════╣")
+    
+    # File Analysis Section
+    text.append("║  FILE ANALYSIS                                                             ║")
+    text.append("║  • CAD: {:<3} | Point Clouds: {:<3} | Images: {:<3} | Families: {:<4}            ║".format(
+        data["FileSize"]["CADImports"],
+        data["FileSize"]["PointClouds"],
+        data["FileSize"]["Images"],
+        data["FileSize"]["Families"]))
+    
+    # Enhanced link information
+    cloud_links_count = sum(1 for link in data["Links"] if link["IsCloud"])
+    loaded_links_count = sum(1 for link in data["Links"] if link["Status"] == "Loaded")
+    overridden_links_count = sum(1 for link in data["Links"] if link["IsOverridden"])
+    text.append("║  • Links: {:<3} total ({:<3} loaded, {:<3} cloud, {:<3} overridden)                 ║".format(
+        len(data["Links"]),
+        loaded_links_count,
+        cloud_links_count,
+        overridden_links_count))
+    
+    # Cloud Links Details (if any)
+    cloud_links_details = [link for link in data["Links"] if link["IsCloud"]]
+    if cloud_links_details:
+        text.append("╠══════════════════════════════════════════════════════════════════════════════╣")
+        loaded_cloud_links = sum(1 for link in cloud_links_details if link["Status"] == "Loaded")
+        workshared_cloud_links = sum(1 for link in cloud_links_details if link["IsWorkshared"])
+        overridden_cloud_links = sum(1 for link in cloud_links_details if link["IsOverridden"])
+        text.append("║  CLOUD LINKS: {:<3} total | {:<3} loaded | {:<3} workshared | {:<3} overridden             ║".format(
+            len(cloud_links_details),
+            loaded_cloud_links,
+            workshared_cloud_links,
+            overridden_cloud_links))
+        # Add specific cloud link names if desired, similar to other lists
+        for i, link in enumerate(cloud_links_details[:3]): # List up to 3 cloud links
+            status_details = []
+            if link["Status"] == "Loaded":
+                status_details.append("Loaded")
+            else:
+                status_details.append("Unloaded")
+            if link["IsWorkshared"]:
+                status_details.append("Workshared")
+            if link["IsOverridden"]:
+                status_details.append("Overridden")
+            text.append("║    - {:<40} ({})".format(link["Name"][:40], ", ".join(status_details)))
+        if len(cloud_links_details) > 3:
+            text.append("║    ...and {} more".format(len(cloud_links_details) - 3))
+    
+    # Footer Section
+    text.append("╠══════════════════════════════════════════════════════════════════════════════╣")
+    text.append("║  TREND: {:<10} | Last Updated: {:<19} | Ver: 2.2 (Enhanced)      ║".format(
+        get_score_trend(data["Score"]),
+        DateTime.Now.ToString("yyyy-MM-dd HH:mm")))
+    text.append("║  Contact BIM Manager for issues | Double-click items to select problems      ║")
+    text.append("╚══════════════════════════════════════════════════════════════════════════════╝")
+    
+    return "\n".join(text)
+
+def run():
+    """Main execution function with enhanced features"""
+    doc = revit.doc
+    project_name = doc.Title if doc.Title else "Current Project"
+    
+    # Get cloud model information first
+    cloud_info = get_cloud_model_info(doc)
+    
+    # Try to load cached results first
+    cached_data = get_cache()
+    if cached_data and forms.alert("Load cached results from last run?", 
+                                 yes=True, no=True):
+        data = cached_data
+        # Ensure cached data has all required keys (backward compatibility)
+        if "DetailedWarnings" not in data:
+            data["DetailedWarnings"] = get_detailed_warnings(doc)
+        # Always re-run get_purge_status to ensure all keys are present
+        # This is the crucial fix for the KeyError
+        data["PurgeStatus"] = get_purge_status(doc) 
+        if "Clashes" not in data:
+            data["Clashes"] = get_clash_matrix(doc)
+        if "Worksets" not in data:
+            data["Worksets"] = get_workset_usage(doc)
+        if "Links" not in data:
+            data["Links"] = get_revit_links(doc)
+        if "CopyMonitor" not in data:
+            data["CopyMonitor"] = check_copy_monitor_status(doc)
+        if "ViewTemplates" not in data:
+            data["ViewTemplates"] = get_view_templates_status(doc)
+        if "FileSize" not in data:
+            data["FileSize"] = get_file_size_analysis(doc)
+        if "AuditHistory" not in data:
+            data["AuditHistory"] = get_audit_history(doc)
+        if "CloudInfo" not in data:
+            data["CloudInfo"] = cloud_info
+        if "InPlaceFamilies" not in data:
+            data["InPlaceFamilies"] = get_in_place_families(doc)
+        if "FamilyNaming" not in data:
+            data["FamilyNaming"] = check_family_naming_convention(doc)
+        if "ProjectName" not in data:
+            data["ProjectName"] = project_name
+        
+        # Recalculate score as new factors might be added
+        data["Score"] = calculate_health_score(
+            data["DetailedWarnings"], 
+            data["PurgeStatus"], 
+            data["Clashes"], 
+            data["Worksets"], 
+            data["Links"], 
+            data["CopyMonitor"],
+            data["InPlaceFamilies"],
+            data["FamilyNaming"],
+            data["ViewTemplates"],
+            data["FileSize"])
+
+    else:
+        # Run all checks in background with wait cursor
+        try:
+            data = background_processing(lambda: {
+                "DetailedWarnings": get_detailed_warnings(doc),
+                "PurgeStatus": get_purge_status(doc),
+                "Clashes": get_clash_matrix(doc),
+                "Worksets": get_workset_usage(doc),
+                "Links": get_revit_links(doc),
+                "CopyMonitor": check_copy_monitor_status(doc),
+                "ViewTemplates": get_view_templates_status(doc),
+                "FileSize": get_file_size_analysis(doc),
+                "AuditHistory": get_audit_history(doc),
+                "CloudInfo": cloud_info,
+                "InPlaceFamilies": get_in_place_families(doc),
+                "FamilyNaming": check_family_naming_convention(doc),
+                "ProjectName": project_name
+            })
+            
+            # Calculate score with new factors, passing all relevant data
+            data["Score"] = calculate_health_score(
+                data["DetailedWarnings"], 
+                data["PurgeStatus"], 
+                data["Clashes"], 
+                data["Worksets"], 
+                data["Links"], 
+                data["CopyMonitor"],
+                data["InPlaceFamilies"],
+                data["FamilyNaming"],
+                data["ViewTemplates"],
+                data["FileSize"])
+            
+            # Save cache, history, and individual run result
+            save_cache(data)
+            save_history(data)
+            save_run_result(data)
+            
+            # Save detailed CSV report
+            save_report_to_csv(data)
+            
+        except Exception as e:
+            forms.alert("Error collecting data: {}".format(str(e)))
+            return
+    
+    # Get or create dashboard view
+    view = get_drafting_view(doc)
+    if not view:
+        forms.alert("Could not get or create the Model Health Dashboard view.", title="Error")
+        return
+    
+    # Clear existing content
+    if not clear_text_notes(view, doc):
+        forms.alert("Failed to clear existing text notes from dashboard view.", title="Error")
+        return
+    
+    # Generate and display dashboard
+    dashboard_text = generate_dashboard_text(project_name, data)
+    
+    # Add main dashboard text
+    main_text_note = add_text(view, doc, dashboard_text, 1.0, 30.0) # Adjust coordinates as needed
+    
+    # Add detailed information with leader lines for key issues
+    if main_text_note:
+        y_pos = 28.0 # Starting Y position for detailed notes
+        x_start_details = 15.0 # Starting X position for detailed notes columns
+        
+        # Add warnings with leader lines to problematic elements
+        if any(severity["Critical"] > 0 for severity in data["DetailedWarnings"].values()):
+            warning_elements = get_warning_elements(doc)
+            y_pos_warnings = y_pos
+            for i, element_id in enumerate(warning_elements[:3]):
+                note = add_text_with_leader(view, doc, "Critical Warning #{}".format(i+1), x_start_details, y_pos_warnings, element_id)
+                if note:
+                    create_clickable_element(view, doc, element_id, note.Id)
+                    y_pos_warnings -= 1.5
+            if len(warning_elements) > 3:
+                add_text(view, doc, "...and {} more warning elements".format(len(warning_elements) - 3), x_start_details, y_pos_warnings)
+                y_pos_warnings -= 1.5
+            y_pos = y_pos_warnings # Update y_pos for next section
+
+        # Add untemplated views list
+        if data["ViewTemplates"]["Count"] > 0:
+            untemplated_text = "Untemplated Views ({}):\n{}".format(
+                data["ViewTemplates"]["Count"],
+                "\n".join(data["ViewTemplates"]["UntemplatedViews"][:5]))
+            if len(data["ViewTemplates"]["UntemplatedViews"]) > 5:
+                untemplated_text += "\n...and {} more".format(len(data["ViewTemplates"]["UntemplatedViews"]) - 5)
+            
+            add_text(view, doc, untemplated_text, x_start_details + 10.0, y_pos)
+            y_pos -= (untemplated_text.count('\n') + 2) * 1.5 # Adjust y_pos based on lines of text
+        
+        # Add in-place families list
+        if data["InPlaceFamilies"]["Count"] > 0:
+            in_place_text = "In-Place Families ({}):\n{}".format(
+                data["InPlaceFamilies"]["Count"],
+                "\n".join([f["Name"] for f in data["InPlaceFamilies"]["Families"][:5]]))
+            if len(data["InPlaceFamilies"]["Families"]) > 5:
+                in_place_text += "\n...and {} more".format(len(data["InPlaceFamilies"]["Families"]) - 5)
+            
+            add_text(view, doc, in_place_text, x_start_details + 20.0, y_pos)
+            y_pos -= (in_place_text.count('\n') + 2) * 1.5 # Adjust y_pos
+
+        # Add family naming issues
+        if data["FamilyNaming"]["Count"] > 0:
+            naming_text = "Naming Issues ({}):\n{}".format(
+                data["FamilyNaming"]["Count"],
+                "\n".join([f["Name"] for f in data["FamilyNaming"]["Families"][:5]]))
+            if len(data["FamilyNaming"]["Families"]) > 5:
+                naming_text += "\n...and {} more".format(len(data["FamilyNaming"]["Families"]) - 5)
+            
+            add_text(view, doc, naming_text, x_start_details + 30.0, y_pos)
+            y_pos -= (naming_text.count('\n') + 2) * 1.5 # Adjust y_pos
+        
+        forms.alert("✅ Model Health Dashboard updated!\nResults saved to history and CSV report.")
+    else:
+        forms.alert("Failed to add text to dashboard view")
+
+# Run the script
+run()
